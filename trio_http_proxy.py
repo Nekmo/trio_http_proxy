@@ -6,6 +6,14 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+# MitM HTTP proxy using Trio. Use an HTTPS certificate to capture and
+# manipulate requests.
+# Before using it, run mitmproxy to create the certificate on your machine.
+#
+# WARNING: This script has a memory leak. Do not use it in production.
+
+import os
+import ssl
 from contextvars import ContextVar
 from functools import partial
 from io import DEFAULT_BUFFER_SIZE
@@ -16,9 +24,11 @@ from traceback import format_exc
 
 import h11
 import trio
+from mitmproxy.certs import CertStore
+from mitmproxy.options import CONF_BASENAME
+from trio import SSLStream
 
-
-DEFAULT_PORT = 8080
+DEFAULT_PORT = 5000
 PORT = int(getenv('PORT', DEFAULT_PORT))
 OK_CONNECT_PORTS = {443, 8443}
 
@@ -29,6 +39,31 @@ decoded_and_indented = lambda some_bytes: indented(some_bytes.decode())
 CV_CLIENT_STREAM = ContextVar('client_stream', default=None)
 CV_DEST_STREAM = ContextVar('dest_stream', default=None)
 CV_PIPE_FROM = ContextVar('pipe_from', default=None)
+TMP_DIR = '/tmp'
+CERT_STORE_CONFIG_DIR = '~/.mitmproxy/'
+CERT_STORE_PRIVATE_KEY = '~/.mitmproxy/mitmproxy-ca.pem'
+
+certstore = CertStore.from_store(
+    path=os.path.expanduser(CERT_STORE_CONFIG_DIR),
+    basename=CONF_BASENAME,
+    key_size=2048,
+    passphrase=None,
+)
+cert_key: str = os.path.expanduser(CERT_STORE_PRIVATE_KEY)
+
+
+def get_cert_path(server_hostname: str) -> str:
+    cert_path = os.path.join(TMP_DIR, f'{server_hostname}.pem')
+    if os.path.lexists(cert_path):
+        return cert_path
+    altnames = [server_hostname]
+    organization = 'Meta-Proxy'
+    cert = certstore.get_cert(altnames[0], altnames, organization)
+    pem_cert = cert.cert.to_pem()
+    cert_path = os.path.join(TMP_DIR, f'{server_hostname}.pem')
+    with open(cert_path, 'wb') as f:
+        f.write(pem_cert)
+    return cert_path
 
 
 async def http_proxy(client_stream, _nextid=count(1).__next__):
@@ -36,10 +71,15 @@ async def http_proxy(client_stream, _nextid=count(1).__next__):
     CV_CLIENT_STREAM.set(client_stream)
     async with client_stream:
         try:
-            dest_stream = await tunnel(client_stream)
-            async with dest_stream, trio.open_nursery() as nursery:
-                nursery.start_soon(pipe, client_stream, dest_stream)
-                nursery.start_soon(pipe, dest_stream, client_stream)
+            dest_stream, server_hostname = await tunnel(client_stream)
+
+            context = ssl.SSLContext()
+            context.load_cert_chain(get_cert_path(server_hostname), cert_key)
+            https_client_stream = SSLStream(client_stream, context, server_hostname=server_hostname, server_side=True)
+
+            async with https_client_stream, dest_stream, trio.open_nursery() as nursery:
+                nursery.start_soon(pipe, https_client_stream, dest_stream)
+                nursery.start_soon(pipe, dest_stream, https_client_stream)
         except Exception:
             log(f'\n{indented(format_exc())}')
 
@@ -60,14 +100,14 @@ async def tunnel(client_stream):
     """
     desthost, destport = await process_as_connect_request(client_stream)
     log(f'Got CONNECT request for {desthost}:{destport}, connecting...')
-    dest_stream = await trio.open_tcp_stream(desthost, destport)
+    dest_stream = await trio.open_ssl_over_tcp_stream(desthost, destport)
     dest_stream.host = desthost
     dest_stream.port = destport
     CV_DEST_STREAM.set(dest_stream)
     log(f'Connected to {desthost}, sending 200 to client...')
     await client_stream.send_all(b'HTTP/1.1 200 Connection established\r\n\r\n')
     log('Sent 200 to client, tunnel established.')
-    return dest_stream
+    return dest_stream, desthost
 
 
 async def process_as_connect_request(stream, bufmaxsz=DEFAULT_BUFFER_SIZE, maxreqsz=16384):
